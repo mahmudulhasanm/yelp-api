@@ -72,6 +72,9 @@ class Yelp:
 
     def _get(self, url: str, params: dict = None, headers: dict = None) -> str:
         c = self._client()
+        # primp requires all query-param values to be strings.
+        if params:
+            params = {k: str(v) for k, v in params.items() if v is not None}
         r = c.get(url, params=params, headers=self._headers(headers))
         if r.status_code != 200:
             raise YelpError(f"GET {url} -> HTTP {r.status_code} (likely blocked; try a proxy)")
