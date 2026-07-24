@@ -95,12 +95,18 @@ async def debug_inspect(
             return [keyshape(node[0], d - 1)] if node else []
         return type(node).__name__
 
+    from Yelp.parser import extract_ld_json, _ld_business_by_alias
+
     html = Crawlbase().get(url)
     root = extract_root_props(html)
+    ld_blocks = extract_ld_json(html)
     out = {
         "html_len": len(html),
         "root_keys": list(root.keys()),
         "biz_id": extract_biz_id(html),
+        "ld_json_count": len(ld_blocks),
+        "ld_json_types": [b.get("@type") if isinstance(b, dict) else type(b).__name__ for b in ld_blocks],
+        "ld_business_sample": dict(list(_ld_business_by_alias(html).items())[:3]),
         "legacyProps_shape": keyshape(root.get("legacyProps", {}), depth),
     }
 

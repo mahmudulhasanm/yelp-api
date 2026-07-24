@@ -13,6 +13,77 @@ this payload frequently.
 import json
 import re
 from typing import Optional
+from urllib.parse import unquote
+
+
+# ---------------------------------------------------------------------------
+# schema.org JSON-LD  (Yelp bot-strips react_root_props but still emits an
+# ItemList of businesses as JSON-LD, which carries name/rating/address/price)
+# ---------------------------------------------------------------------------
+
+_LD_RE = re.compile(
+    r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def extract_ld_json(html: str) -> list:
+    blocks = []
+    for m in _LD_RE.finditer(html):
+        raw = m.group(1).strip()
+        try:
+            blocks.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+    return blocks
+
+
+def _iter_ld_items(html: str):
+    """Yield business `item` dicts from any schema.org ItemList in the page."""
+    for blk in extract_ld_json(html):
+        candidates = blk if isinstance(blk, list) else [blk]
+        for node in candidates:
+            if not isinstance(node, dict):
+                continue
+            elements = node.get("itemListElement")
+            if not elements and node.get("@graph"):
+                for g in node["@graph"]:
+                    if isinstance(g, dict) and g.get("itemListElement"):
+                        elements = g["itemListElement"]
+                        break
+            for el in elements or []:
+                item = el.get("item") if isinstance(el, dict) else None
+                if isinstance(item, dict):
+                    yield item
+
+
+def _ld_business_by_alias(html: str) -> dict:
+    """Map alias -> normalised business fields from JSON-LD."""
+    out = {}
+    for item in _iter_ld_items(html):
+        alias = _alias_from_url(item.get("url") or item.get("@id"))
+        if not alias:
+            continue
+        rating = item.get("aggregateRating") or {}
+        addr = item.get("address") or {}
+        if isinstance(addr, dict):
+            address = ", ".join(
+                str(addr.get(k)) for k in
+                ("streetAddress", "addressLocality", "addressRegion", "postalCode")
+                if addr.get(k)
+            ) or None
+        else:
+            address = str(addr) or None
+        out[alias] = {
+            "name": item.get("name"),
+            "rating": rating.get("ratingValue"),
+            "review_count": rating.get("reviewCount") or rating.get("ratingCount"),
+            "price": item.get("priceRange"),
+            "phone": item.get("telephone"),
+            "address": address,
+            "image": item.get("image") if isinstance(item.get("image"), str) else None,
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +164,33 @@ def parse_search(html: str, include_ads: bool = False) -> dict:
             if biz:
                 businesses.append(biz)
 
+    # Enrich from schema.org JSON-LD (fills name/rating/review_count/price/
+    # address/phone that Yelp strips from react_root_props for bots).
+    ld = _ld_business_by_alias(html)
+    if ld:
+        for b in businesses:
+            info = ld.get(b.get("alias"))
+            if not info:
+                continue
+            if info.get("name"):
+                b["name"] = info["name"]  # real name beats alias-derived guess
+            for field in ("rating", "review_count", "price", "phone", "address"):
+                if b.get(field) in (None, [], "") and info.get(field) is not None:
+                    b[field] = info[field]
+            if not b.get("photo") and info.get("image"):
+                b["photo"] = info["image"]
+                b["photos"] = b.get("photos") or [info["image"]]
+            # if we filled the key fields, it's no longer partial
+            if b.get("name") and b.get("rating") is not None:
+                b["partial"] = False
+
     return {"total_results": total, "businesses": businesses}
 
 
 def _alias_from_url(url: Optional[str]) -> Optional[str]:
     if url and "/biz/" in url:
-        return url.split("/biz/")[-1].split("?")[0].strip("/")
+        alias = url.split("/biz/")[-1].split("?")[0].strip("/")
+        return unquote(alias)  # decode %C3%AA -> ê
     return None
 
 
@@ -132,6 +224,8 @@ def _normalise_search_item(res: dict) -> Optional[dict]:
             photos.append(p["src"])
     snippet = res.get("snippet")
     snippet_text = snippet.get("text") if isinstance(snippet, dict) else None
+    if snippet_text:
+        snippet_text = snippet_text.replace("[[HIGHLIGHT]]", "").replace("[[ENDHIGHLIGHT]]", "").strip()
 
     biz = res.get("searchResultBusiness")
     if isinstance(biz, dict) and biz.get("name"):
