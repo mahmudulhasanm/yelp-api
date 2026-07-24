@@ -66,6 +66,46 @@ class Yelp:
         self.timeout = int(os.getenv("REQUEST_TIMEOUT", timeout))
         self.review_doc_id = os.getenv("YELP_REVIEW_DOC_ID", DEFAULT_REVIEW_DOC_ID)
 
+        # Bright Data Web Unlocker *API* mode. If an API key is present we route
+        # every request through https://api.brightdata.com/request instead of a
+        # proxy tunnel — no CONNECT tunneling, no cert issues. Most reliable path.
+        self.api_key = os.getenv("BRIGHTDATA_API_KEY") or None
+        self.unlocker_zone = os.getenv("BRIGHTDATA_ZONE", "web_unlocker1")
+        self.unlocker_country = os.getenv("BRIGHTDATA_COUNTRY", "us")
+        self.api_mode = bool(self.api_key)
+
+    # -- Web Unlocker API --------------------------------------------------
+    def _api_request(self, target_url: str, method: str = "GET",
+                     body: Optional[str] = None, extra_headers: dict = None) -> str:
+        """Fetch a URL through Bright Data's Web Unlocker /request API."""
+        payload = {
+            "zone": self.unlocker_zone,
+            "url": target_url,
+            "format": "raw",
+            "country": self.unlocker_country,
+        }
+        if method and method.upper() != "GET":
+            payload["method"] = method.upper()
+            if body is not None:
+                payload["data"] = body
+        if extra_headers:
+            payload["headers"] = extra_headers
+
+        c = PrimpClient(timeout=self.timeout)  # plain call to Bright Data (no proxy)
+        r = c.post(
+            "https://api.brightdata.com/request",
+            content=json.dumps(payload),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        if r.status_code != 200:
+            raise YelpError(
+                f"Web Unlocker API -> HTTP {r.status_code}: {r.text[:200]}"
+            )
+        return r.text
+
     # -- session -----------------------------------------------------------
     def _client(self) -> PrimpClient:
         kwargs = dict(impersonate=IMPERSONATE, timeout=self.timeout)
@@ -85,16 +125,22 @@ class Yelp:
         return PrimpClient(timeout=self.timeout, **({"proxy": self.proxy} if self.proxy else {}))
 
     def _get(self, url: str, params: dict = None, headers: dict = None) -> str:
-        c = self._client()
         # primp requires all query-param values to be strings.
         if params:
+            from urllib.parse import urlencode
             params = {k: str(v) for k, v in params.items() if v is not None}
-        r = c.get(url, params=params, headers=self._headers(headers))
+            url = url + ("&" if "?" in url else "?") + urlencode(params)
+        if self.api_mode:
+            return self._api_request(url, "GET")
+        c = self._client()
+        r = c.get(url, headers=self._headers(headers))
         if r.status_code != 200:
             raise YelpError(f"GET {url} -> HTTP {r.status_code} (likely blocked; try a proxy)")
         return r.text
 
     def _post(self, url: str, content: str, headers: dict = None) -> str:
+        if self.api_mode:
+            return self._api_request(url, "POST", body=content, extra_headers=headers)
         c = self._client()
         r = c.post(url, content=content, headers=self._headers(headers))
         if r.status_code != 200:
@@ -132,19 +178,6 @@ class Yelp:
         """
         from urllib.parse import quote_plus
 
-        c = self._client()
-
-        # 1) Warm up a session: load the homepage so Yelp sets its consent /
-        #    session cookies on this client before we ask for data. Hitting the
-        #    data endpoints cold is a strong bot signal.
-        #    Skipped under Web Unlocker (it handles anti-bot itself, and each
-        #    request is billed — no sense paying for a warmup hit).
-        if not self.unlocker:
-            try:
-                c.get(BASE + "/", headers=self._headers())
-            except Exception:
-                pass
-
         q, loc = quote_plus(term), quote_plus(location)
         page_url = f"{BASE}/search?find_desc={q}&find_loc={loc}"
         if offset:
@@ -153,6 +186,29 @@ class Yelp:
             page_url += f"&sortby={sort_by}"
         if price:
             page_url += f"&attrs=RestaurantsPriceRange2.{price}"
+
+        # Web Unlocker API mode: it handles anti-bot itself, so just fetch the
+        # full search page in one call.
+        if self.api_mode:
+            html = self._api_request(page_url, "GET")
+            result = parse_search(html)
+            result["businesses"] = result["businesses"][:limit]
+            result["term"] = term
+            result["location"] = location
+            result["offset"] = offset
+            result["search_url"] = page_url
+            return result
+
+        c = self._client()
+
+        # 1) Warm up a session: load the homepage so Yelp sets its consent /
+        #    session cookies on this client before we ask for data. Hitting the
+        #    data endpoints cold is a strong bot signal.
+        if not self.unlocker:
+            try:
+                c.get(BASE + "/", headers=self._headers())
+            except Exception:
+                pass
 
         # 2) Prefer the full search *page* (same react_root_props payload as the
         #    XHR snippet, but far less aggressively bot-filtered).
