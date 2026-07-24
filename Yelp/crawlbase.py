@@ -60,6 +60,12 @@ class Crawlbase:
         }
         if self.use_js:
             p["javascript"] = "true"
+            # Give Yelp's client-side hydration time to load, then wait for the
+            # in-flight XHRs to settle, so the rendered HTML actually contains data.
+            p["ajax_wait"] = "true"
+            page_wait = os.getenv("CRAWLBASE_PAGE_WAIT")  # ms
+            if page_wait:
+                p["page_wait"] = page_wait
         if extra:
             p.update({k: str(v) for k, v in extra.items()})
         return p

@@ -96,45 +96,89 @@ def parse_search(html: str, include_ads: bool = False) -> dict:
     return {"total_results": total, "businesses": businesses}
 
 
+def _alias_from_url(url: Optional[str]) -> Optional[str]:
+    if url and "/biz/" in url:
+        return url.split("/biz/")[-1].split("?")[0].strip("/")
+    return None
+
+
+def _name_from_alias(alias: Optional[str]) -> Optional[str]:
+    """Best-effort display name from a slug when Yelp strips the real name.
+    'blue-bottle-coffee-san-francisco-8' -> 'Blue Bottle Coffee San Francisco'."""
+    if not alias:
+        return None
+    parts = [p for p in alias.split("-") if not p.isdigit()]
+    return " ".join(w.capitalize() for w in parts) or None
+
+
 def _normalise_search_item(res: dict) -> Optional[dict]:
-    """Flatten one search result into a stable shape, or None if it has no
-    business payload (some cards are portfolios/placeholders)."""
+    """Flatten one search result into a stable shape.
+
+    Handles two cases:
+      - Full page: `searchResultBusiness` populated -> all fields.
+      - Bot-stripped page: `searchResultBusiness` is null, but the result still
+        carries bizId + businessUrl (alias) + photos + snippet -> return those,
+        flagged `partial: true`, so /search is still usable.
+    """
     if not isinstance(res, dict):
         return None
-    biz = res.get("searchResultBusiness")
-    if not isinstance(biz, dict) or not biz.get("name"):
+    biz_id = res.get("bizId")
+    if not biz_id:
         return None
-
-    categories = [
-        c.get("title")
-        for c in (biz.get("categories") or [])
-        if isinstance(c, dict) and c.get("title")
-    ]
 
     photos = []
     for p in ((res.get("scrollablePhotos") or {}).get("photoList") or []):
         if isinstance(p, dict) and p.get("src"):
             photos.append(p["src"])
-
     snippet = res.get("snippet")
     snippet_text = snippet.get("text") if isinstance(snippet, dict) else None
 
+    biz = res.get("searchResultBusiness")
+    if isinstance(biz, dict) and biz.get("name"):
+        categories = [
+            c.get("title")
+            for c in (biz.get("categories") or [])
+            if isinstance(c, dict) and c.get("title")
+        ]
+        return {
+            "id": biz_id,
+            "alias": biz.get("alias") or _alias_from_url(res.get("businessUrl")),
+            "name": biz.get("name"),
+            "url": _abs_url(biz.get("businessUrl") or res.get("businessUrl")),
+            "rating": biz.get("rating"),
+            "review_count": biz.get("reviewCount"),
+            "price": biz.get("priceRange"),
+            "categories": categories,
+            "phone": biz.get("phone"),
+            "address": biz.get("formattedAddress"),
+            "neighborhoods": biz.get("neighborhoods") or [],
+            "is_ad": bool(biz.get("isAd") or res.get("isAd")),
+            "photo": photos[0] if photos else None,
+            "photos": photos,
+            "snippet": snippet_text,
+            "partial": False,
+        }
+
+    # Bot-stripped fallback.
+    business_url = res.get("businessUrl")
+    alias = _alias_from_url(business_url)
     return {
-        "id": res.get("bizId"),
-        "alias": biz.get("alias"),
-        "name": biz.get("name"),
-        "url": _abs_url(biz.get("businessUrl") or res.get("businessUrl")),
-        "rating": biz.get("rating"),
-        "review_count": biz.get("reviewCount"),
-        "price": biz.get("priceRange"),
-        "categories": categories,
-        "phone": biz.get("phone"),
-        "address": biz.get("formattedAddress"),
-        "neighborhoods": biz.get("neighborhoods") or [],
-        "is_ad": bool(biz.get("isAd") or res.get("isAd")),
+        "id": biz_id,
+        "alias": alias,
+        "name": _name_from_alias(alias),
+        "url": _abs_url(business_url),
+        "rating": None,
+        "review_count": None,
+        "price": None,
+        "categories": [],
+        "phone": None,
+        "address": None,
+        "neighborhoods": [],
+        "is_ad": bool(res.get("isAd")),
         "photo": photos[0] if photos else None,
         "photos": photos,
         "snippet": snippet_text,
+        "partial": True,
     }
 
 
