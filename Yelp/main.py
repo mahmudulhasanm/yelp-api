@@ -63,7 +63,6 @@ class Yelp:
         # TLS interception, so we disable cert verification and skip the
         # session-warmup request (each request through it is billed separately).
         self.unlocker = _truthy(os.getenv("BRIGHTDATA_UNLOCKER"))
-        self.timeout = int(os.getenv("REQUEST_TIMEOUT", timeout))
         self.review_doc_id = os.getenv("YELP_REVIEW_DOC_ID", DEFAULT_REVIEW_DOC_ID)
 
         # Bright Data Web Unlocker *API* mode. If an API key is present we route
@@ -73,6 +72,12 @@ class Yelp:
         self.unlocker_zone = os.getenv("BRIGHTDATA_ZONE", "web_unlocker1")
         self.unlocker_country = os.getenv("BRIGHTDATA_COUNTRY", "us")
         self.api_mode = bool(self.api_key)
+
+        # Web Unlocker renders + solves challenges server-side and can take
+        # 40-90s on a hard target, so it needs a much longer timeout than a
+        # plain proxy request.
+        default_timeout = 120 if self.api_mode else timeout
+        self.timeout = int(os.getenv("REQUEST_TIMEOUT", default_timeout))
 
     # -- Web Unlocker API --------------------------------------------------
     def _api_request(self, target_url: str, method: str = "GET",
