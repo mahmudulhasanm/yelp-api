@@ -1,3 +1,4 @@
-from Yelp.brightdata import BrightDataYelp, BrightDataError, alias_to_url
+from Yelp.main import Yelp, YelpError
+from Yelp.crawlbase import Crawlbase, CrawlbaseError
 
-__all__ = ["BrightDataYelp", "BrightDataError", "alias_to_url"]
+__all__ = ["Yelp", "YelpError", "Crawlbase", "CrawlbaseError"]

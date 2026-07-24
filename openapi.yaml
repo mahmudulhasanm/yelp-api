@@ -1,12 +1,12 @@
 openapi: 3.0.3
 info:
-  title: Yelp API (Bright Data)
+  title: Yelp API (via Crawlbase)
   description: >-
-    Yelp business & review data via Bright Data's prebuilt Yelp Web Scraper API.
-    Asynchronous job model: POST to trigger a collection, receive a job_id, then
-    poll GET /result/{job_id} until the records are ready. Collection covers
-    business details and reviews by business URL or alias.
-  version: "2.0.0"
+    Unofficial Yelp data API. Search businesses by term and location, fetch full
+    business details (hours, phone, website, categories, photos, coordinates),
+    paginate reviews, and get search autocomplete suggestions. Yelp pages are
+    fetched through the Crawlbase Crawling API and parsed into clean JSON.
+  version: "3.0.0"
   contact:
     name: Mahmudul Hasan
     email: mahmudulhasan.dev@gmail.com
@@ -15,93 +15,143 @@ servers:
     description: Production server (replace with your hosted API base URL)
 
 tags:
-  - name: Collect
-    description: Trigger async Yelp collections
-  - name: Result
-    description: Poll job status and fetch results
+  - name: Search
+    description: Business search and autocomplete
+  - name: Business
+    description: Business details and reviews
 
 paths:
-  /business/collect:
-    post:
-      tags: [Collect]
-      summary: Trigger a Yelp business-detail collection
-      operationId: collectBusiness
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CollectInput" }
-            example: { url: "https://www.yelp.com/biz/blue-bottle-coffee-san-francisco-8" }
-      responses:
-        "200":
-          description: Job triggered
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/TriggerResponse" }
-
-  /reviews/collect:
-    post:
-      tags: [Collect]
-      summary: Trigger a Yelp reviews collection
-      description: Requires BRIGHTDATA_YELP_REVIEWS_DATASET to be configured.
-      operationId: collectReviews
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/CollectInput" }
-            example: { url: "https://www.yelp.com/biz/blue-bottle-coffee-san-francisco-8", limit_per_input: 20 }
-      responses:
-        "200":
-          description: Job triggered
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/TriggerResponse" }
-
-  /result/{job_id}:
+  /search:
     get:
-      tags: [Result]
-      summary: Poll job status and fetch results
-      operationId: getResult
+      tags: [Search]
+      summary: Search businesses by term and location
+      operationId: searchBusinesses
       parameters:
-        - name: job_id
-          in: path
-          required: true
-          description: job_id (snapshot_id) returned by a /collect call
-          schema: { type: string, example: s_m4x7enmven8djfqak }
+        - { name: term, in: query, required: true, schema: { type: string, example: coffee } }
+        - { name: location, in: query, required: true, schema: { type: string, example: "San Francisco, CA" } }
+        - { name: offset, in: query, required: false, schema: { type: integer, default: 0, minimum: 0 } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 10, minimum: 1, maximum: 10 } }
+        - { name: sort_by, in: query, required: false, schema: { type: string, example: rating } }
+        - { name: price, in: query, required: false, schema: { type: string, example: "1,2" } }
       responses:
         "200":
-          description: Job status or results
+          description: Search results
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/ResultResponse" }
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+
+  /business/{id}:
+    get:
+      tags: [Business]
+      summary: Business details by alias or encoded id
+      operationId: businessDetails
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, example: blue-bottle-coffee-san-francisco-8 } }
+      responses:
+        "200":
+          description: Business detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BusinessResponse" }
+
+  /reviews:
+    get:
+      tags: [Business]
+      summary: Reviews for a business
+      operationId: businessReviews
+      parameters:
+        - { name: business_id, in: query, required: true, schema: { type: string, example: Lw7NmZ3j-WEye97ywEmkXQ } }
+        - { name: offset, in: query, required: false, schema: { type: integer, default: 0, minimum: 0 } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 10, minimum: 1, maximum: 50 } }
+        - { name: sort_by, in: query, required: false, schema: { type: string, default: DATE_DESC } }
+        - { name: language, in: query, required: false, schema: { type: string, default: en } }
+      responses:
+        "200":
+          description: Reviews
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReviewsResponse" }
+
+  /autocomplete:
+    get:
+      tags: [Search]
+      summary: Search suggestions for a typed prefix
+      operationId: autocomplete
+      parameters:
+        - { name: prefix, in: query, required: true, schema: { type: string, example: coff } }
+        - { name: location, in: query, required: false, schema: { type: string, example: "San Francisco, CA" } }
+      responses:
+        "200":
+          description: Suggestions
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AutocompleteResponse" }
 
 components:
   schemas:
-    CollectInput:
-      type: object
-      description: Provide a single url/alias, or a batch via urls/aliases.
-      properties:
-        url: { type: string, example: "https://www.yelp.com/biz/blue-bottle-coffee-san-francisco-8" }
-        alias: { type: string, example: "blue-bottle-coffee-san-francisco-8" }
-        urls: { type: array, items: { type: string } }
-        aliases: { type: array, items: { type: string } }
-        limit_per_input: { type: integer, description: "Reviews only: max reviews per business", example: 20 }
-    TriggerResponse:
+    Business:
       type: object
       properties:
-        status: { type: string, example: triggered }
-        type: { type: string, example: business }
-        job_id: { type: string, example: s_m4x7enmven8djfqak }
-        poll: { type: string, example: /result/s_m4x7enmven8djfqak }
-    ResultResponse:
+        id: { type: string }
+        alias: { type: string }
+        name: { type: string }
+        url: { type: string }
+        rating: { type: number }
+        review_count: { type: integer }
+        price: { type: string }
+        categories: { type: array, items: { type: string } }
+        phone: { type: string }
+        address: { type: string }
+        latitude: { type: number }
+        longitude: { type: number }
+        photo: { type: string }
+    SearchResponse:
       type: object
       properties:
-        status: { type: string, enum: [running, ready, failed, error], example: ready }
-        job_id: { type: string }
-        type: { type: string, example: business }
-        results_count: { type: integer, example: 1 }
-        records:
-          type: array
-          items: { type: object, additionalProperties: true }
-          description: Bright Data structured Yelp output (business or review objects)
+        status: { type: string, example: success }
+        term: { type: string }
+        location: { type: string }
+        total_results: { type: integer }
+        results_count: { type: integer }
+        businesses: { type: array, items: { $ref: "#/components/schemas/Business" } }
+    BusinessResponse:
+      type: object
+      properties:
+        status: { type: string, example: success }
+        business: { $ref: "#/components/schemas/BusinessDetail" }
+    BusinessDetail:
+      allOf:
+        - $ref: "#/components/schemas/Business"
+        - type: object
+          properties:
+            website: { type: string }
+            hours: { type: object, additionalProperties: { type: string } }
+            is_claimed: { type: boolean }
+            photos: { type: array, items: { type: string } }
+            attributes: { type: array, items: { type: object } }
+    Review:
+      type: object
+      properties:
+        id: { type: string }
+        rating: { type: number }
+        text: { type: string }
+        date: { type: string }
+        author_name: { type: string }
+        author_location: { type: string }
+        photos: { type: array, items: { type: string } }
+    ReviewsResponse:
+      type: object
+      properties:
+        status: { type: string, example: success }
+        business_id: { type: string }
+        total_results: { type: integer }
+        results_count: { type: integer }
+        reviews: { type: array, items: { $ref: "#/components/schemas/Review" } }
+    AutocompleteResponse:
+      type: object
+      properties:
+        status: { type: string, example: success }
+        prefix: { type: string }
+        terms: { type: array, items: { type: string } }
+        businesses: { type: array, items: { type: object } }
+        categories: { type: array, items: { type: string } }
