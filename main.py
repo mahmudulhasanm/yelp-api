@@ -91,6 +91,29 @@ async def root():
     }
 
 
+@app.get("/debug/ip")
+async def debug_ip():
+    """Diagnostic: shows the outbound IP/country the app uses.
+
+    If PROXY is set correctly, this reflects the proxy's exit IP. If it shows
+    the server's own IP (or proxy_configured is false), the PROXY env var isn't
+    taking effect. Remove this endpoint once diagnosis is done.
+    """
+    from Yelp.main import Yelp
+    y = Yelp(proxy=PROXY)
+    info = {"proxy_configured": bool(PROXY)}
+    try:
+        # Bright Data's own test endpoint returns the exit IP + geo.
+        info["brdtest"] = y._get("https://geo.brdtest.com/welcome.txt?product=dc&method=native")
+    except Exception as e:
+        info["brdtest_error"] = str(e)
+    try:
+        info["ipify"] = y._get("https://api.ipify.org?format=json")
+    except Exception as e:
+        info["ipify_error"] = str(e)
+    return info
+
+
 @app.get("/search")
 @limiter.limit("50/second")
 async def search_businesses(
