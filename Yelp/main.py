@@ -94,7 +94,7 @@ class Yelp:
         c = PrimpClient(timeout=self.timeout)  # plain call to Bright Data (no proxy)
         r = c.post(
             "https://api.brightdata.com/request",
-            content=json.dumps(payload),
+            content=json.dumps(payload).encode("utf-8"),  # primp wants bytes
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -142,6 +142,8 @@ class Yelp:
         if self.api_mode:
             return self._api_request(url, "POST", body=content, extra_headers=headers)
         c = self._client()
+        if isinstance(content, str):
+            content = content.encode("utf-8")
         r = c.post(url, content=content, headers=self._headers(headers))
         if r.status_code != 200:
             raise YelpError(f"POST {url} -> HTTP {r.status_code} (likely blocked; try a proxy)")
