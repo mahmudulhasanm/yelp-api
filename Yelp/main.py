@@ -52,10 +52,18 @@ class YelpError(Exception):
     pass
 
 
+def _truthy(v) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 class Yelp:
     def __init__(self, proxy: Optional[str] = None, timeout: int = 25):
         self.proxy = proxy or os.getenv("PROXY") or None
-        self.timeout = timeout
+        # Bright Data Web Unlocker mode: it does its own anti-bot handling and
+        # TLS interception, so we disable cert verification and skip the
+        # session-warmup request (each request through it is billed separately).
+        self.unlocker = _truthy(os.getenv("BRIGHTDATA_UNLOCKER"))
+        self.timeout = int(os.getenv("REQUEST_TIMEOUT", timeout))
         self.review_doc_id = os.getenv("YELP_REVIEW_DOC_ID", DEFAULT_REVIEW_DOC_ID)
 
     # -- session -----------------------------------------------------------
@@ -63,12 +71,18 @@ class Yelp:
         kwargs = dict(impersonate=IMPERSONATE, timeout=self.timeout)
         if self.proxy:
             kwargs["proxy"] = self.proxy
-        try:
-            return PrimpClient(**kwargs)
-        except Exception:
-            # Older primp builds name the arg differently / lack the profile.
-            kwargs.pop("impersonate", None)
-            return PrimpClient(**kwargs)
+        # Web Unlocker terminates TLS with its own cert -> skip verification.
+        if self.unlocker or _truthy(os.getenv("PROXY_INSECURE")):
+            kwargs["verify"] = False
+        for attempt in ("full", "no_verify", "minimal"):
+            try:
+                return PrimpClient(**kwargs)
+            except Exception:
+                if attempt == "full":
+                    kwargs.pop("verify", None)      # older primp lacks verify
+                elif attempt == "no_verify":
+                    kwargs.pop("impersonate", None)  # older primp lacks profile
+        return PrimpClient(timeout=self.timeout, **({"proxy": self.proxy} if self.proxy else {}))
 
     def _get(self, url: str, params: dict = None, headers: dict = None) -> str:
         c = self._client()
@@ -123,10 +137,13 @@ class Yelp:
         # 1) Warm up a session: load the homepage so Yelp sets its consent /
         #    session cookies on this client before we ask for data. Hitting the
         #    data endpoints cold is a strong bot signal.
-        try:
-            c.get(BASE + "/", headers=self._headers())
-        except Exception:
-            pass
+        #    Skipped under Web Unlocker (it handles anti-bot itself, and each
+        #    request is billed — no sense paying for a warmup hit).
+        if not self.unlocker:
+            try:
+                c.get(BASE + "/", headers=self._headers())
+            except Exception:
+                pass
 
         q, loc = quote_plus(term), quote_plus(location)
         page_url = f"{BASE}/search?find_desc={q}&find_loc={loc}"
