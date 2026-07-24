@@ -95,18 +95,36 @@ async def debug_inspect(
             return [keyshape(node[0], d - 1)] if node else []
         return type(node).__name__
 
+    import re as _re
     from Yelp.parser import extract_ld_json, _ld_business_by_alias
 
     html = Crawlbase().get(url)
     root = extract_root_props(html)
     ld_blocks = extract_ld_json(html)
+
+    def probe(needle, window=160, flags=0):
+        i = html.find(needle) if not flags else None
+        if flags:
+            m = _re.search(needle, html, flags)
+            i = m.start() if m else -1
+        return html[i:i + window] if i != -1 else None
+
     out = {
         "html_len": len(html),
-        "root_keys": list(root.keys()),
         "biz_id": extract_biz_id(html),
         "ld_json_count": len(ld_blocks),
         "ld_json_types": [b.get("@type") if isinstance(b, dict) else type(b).__name__ for b in ld_blocks],
         "ld_business_sample": dict(list(_ld_business_by_alias(html).items())[:3]),
+        # raw-HTML probes: where does rating data actually live?
+        "raw_counts": {
+            "application/ld+json": html.count("application/ld+json"),
+            "ratingValue": html.count("ratingValue"),
+            "aggregateRating": html.count("aggregateRating"),
+            "star rating": html.count("star rating"),
+            "reviewCount": html.count("reviewCount"),
+        },
+        "sample_star_rating": probe(r'aria-label="[^"]*star rating"', flags=_re.I),
+        "sample_ratingValue": probe("ratingValue"),
         "legacyProps_shape": keyshape(root.get("legacyProps", {}), depth),
     }
 
