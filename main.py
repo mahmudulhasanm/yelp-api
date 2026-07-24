@@ -1,236 +1,218 @@
-from fastapi import FastAPI, HTTPException, Query, Request, Path
-from Yelp.main import Yelp, YelpError
-import typing
-import redis
+from fastapi import FastAPI, Request, Body, Path, Query
 import json
-import hashlib
 import os
 import time
+import redis
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-# Initialize Redis cache
+from Yelp.brightdata import BrightDataYelp, BrightDataError, alias_to_url
+
+# ---------------------------------------------------------------------------
+# Redis: used here as a small job registry (job_id -> {type, input, created})
+# and to cache finished results. Optional — the API still works without it,
+# it just can't label a job's type on /result.
+# ---------------------------------------------------------------------------
 try:
     redis_client = redis.Redis(
-        host=os.getenv('REDIS_HOST', 'localhost'),
-        port=int(os.getenv('REDIS_PORT', 6379)),
-        password=os.getenv('REDIS_PASSWORD', None),
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        password=os.getenv("REDIS_PASSWORD", None),
         decode_responses=True,
         socket_connect_timeout=2,
-        socket_timeout=2
+        socket_timeout=2,
     )
     redis_client.ping()
     CACHE_ENABLED = True
-    print("✅ Redis cache connected")
+    print("✅ Redis connected")
 except Exception as e:
-    print(f"⚠️  Redis cache disabled: {e}")
+    print(f"⚠️  Redis disabled: {e}")
     CACHE_ENABLED = False
     redis_client = None
 
-# Yelp pages change less often than flight prices; cache longer by default.
-CACHE_TTL = int(os.getenv('CACHE_TTL', 3600))       # 1 hour
-REVIEW_TTL = int(os.getenv('REVIEW_TTL', 21600))    # 6 hours
-PROXY = os.getenv('PROXY') or None
+RESULT_TTL = int(os.getenv("RESULT_TTL", 86400))  # keep finished results 24h
+JOB_TTL = int(os.getenv("JOB_TTL", 86400))
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["50/second"])
 
 app = FastAPI(
-    title="Yelp API",
-    description="Unofficial Yelp scraper API — search, business details, reviews, autocomplete.",
-    version="1.0.0",
+    title="Yelp API (Bright Data)",
+    description=(
+        "Yelp business & review data via Bright Data's prebuilt Yelp scrapers. "
+        "Asynchronous job model: POST to trigger a collection, then poll GET /result/{job_id}."
+    ),
+    version="2.0.0",
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
-def get_cache_key(prefix: str, *parts) -> str:
-    key_data = ":".join(str(p) for p in parts)
-    return f"{prefix}:{hashlib.md5(key_data.encode()).hexdigest()}"
+def _save_job(job_id: str, meta: dict):
+    if CACHE_ENABLED:
+        try:
+            redis_client.setex(f"job:{job_id}", JOB_TTL, json.dumps(meta))
+        except Exception as e:
+            print(f"job save error: {e}")
 
 
-def get_from_cache(cache_key: str):
-    if not CACHE_ENABLED:
-        return None
-    try:
-        cached = redis_client.get(cache_key)
-        if cached:
-            return json.loads(cached)
-    except Exception as e:
-        print(f"Cache read error: {e}")
+def _load_job(job_id: str) -> dict:
+    if CACHE_ENABLED:
+        try:
+            v = redis_client.get(f"job:{job_id}")
+            if v:
+                return json.loads(v)
+        except Exception as e:
+            print(f"job load error: {e}")
+    return {}
+
+
+def _cache_result(job_id: str, data: dict):
+    if CACHE_ENABLED:
+        try:
+            redis_client.setex(f"result:{job_id}", RESULT_TTL, json.dumps(data))
+        except Exception as e:
+            print(f"result cache error: {e}")
+
+
+def _cached_result(job_id: str):
+    if CACHE_ENABLED:
+        try:
+            v = redis_client.get(f"result:{job_id}")
+            if v:
+                return json.loads(v)
+        except Exception:
+            return None
     return None
 
 
-def set_to_cache(cache_key: str, data: dict, ttl: int = CACHE_TTL):
-    if not CACHE_ENABLED:
-        return
-    try:
-        redis_client.setex(cache_key, ttl, json.dumps(data))
-    except Exception as e:
-        print(f"Cache write error: {e}")
-
-
-def with_cache(cache_key: str, producer, ttl: int = CACHE_TTL):
-    """Cache wrapper: returns cached result or runs producer and caches it."""
-    cached_data = get_from_cache(cache_key)
-    if cached_data:
-        cache_age = time.time() - cached_data.get('cached_at', time.time())
-        return {**cached_data['data'], "cached": True, "cache_age_seconds": int(cache_age)}
-
-    result = producer()
-    set_to_cache(cache_key, {'data': result, 'cached_at': time.time()}, ttl)
-    return {**result, "cached": False}
+def _inputs_from_body(body: dict):
+    """Accept {"url": ...} / {"alias": ...} / {"urls": [...]} / {"aliases": [...]}"""
+    items = []
+    if body.get("urls"):
+        items = list(body["urls"])
+    elif body.get("aliases"):
+        items = list(body["aliases"])
+    elif body.get("url"):
+        items = [body["url"]]
+    elif body.get("alias"):
+        items = [body["alias"]]
+    return [str(i) for i in items if i]
 
 
 @app.get("/")
 async def root():
     return {
         "status": "ok",
-        "service": "Yelp API (unofficial)",
-        "endpoints": ["/search", "/business/{id}", "/reviews", "/autocomplete", "/docs"],
+        "service": "Yelp API via Bright Data prebuilt scrapers",
+        "model": "async — trigger a job, then poll /result/{job_id}",
+        "endpoints": {
+            "POST /business/collect": "trigger business detail collection by URL/alias",
+            "POST /reviews/collect": "trigger reviews collection by URL/alias",
+            "GET /result/{job_id}": "poll job status / fetch results",
+            "GET /docs": "interactive API docs",
+        },
     }
 
 
-@app.get("/debug/ip")
-async def debug_ip():
-    """Diagnostic: shows the outbound IP/country the app uses.
-
-    If PROXY is set correctly, this reflects the proxy's exit IP. If it shows
-    the server's own IP (or proxy_configured is false), the PROXY env var isn't
-    taking effect. Remove this endpoint once diagnosis is done.
-    """
-    from Yelp.main import Yelp
-    y = Yelp(proxy=PROXY)
-    info = {"proxy_configured": bool(PROXY)}
-    try:
-        # Bright Data's own test endpoint returns the exit IP + geo.
-        info["brdtest"] = y._get("https://geo.brdtest.com/welcome.txt?product=dc&method=native")
-    except Exception as e:
-        info["brdtest_error"] = str(e)
-    try:
-        info["ipify"] = y._get("https://api.ipify.org?format=json")
-    except Exception as e:
-        info["ipify_error"] = str(e)
-    return info
-
-
-@app.get("/search")
+@app.post("/business/collect")
 @limiter.limit("50/second")
-async def search_businesses(
+async def collect_business(
     request: Request,
-    term: str = Query(..., description="Search term, e.g. 'coffee', 'plumbers', 'sushi'"),
-    location: str = Query(..., description="Location, e.g. 'San Francisco, CA'"),
-    offset: int = Query(0, ge=0, description="Result offset (page size is 10)"),
-    limit: int = Query(10, ge=1, le=10, description="Max results to return (<=10 per page)"),
-    sort_by: typing.Optional[str] = Query(None, description="recommended | rating | review_count | distance"),
-    price: typing.Optional[str] = Query(None, description="Price filter: 1..4 or CSV e.g. '1,2' ($..$$$$)"),
+    body: dict = Body(
+        ...,
+        example={"url": "https://www.yelp.com/biz/blue-bottle-coffee-san-francisco-8"},
+    ),
 ):
-    """Search Yelp businesses by term + location."""
+    """Trigger a Yelp **business detail** collection. Returns a job_id to poll."""
     try:
-        cache_key = get_cache_key("yelp_search", term, location, offset, limit, sort_by, price)
-
-        def produce():
-            y = Yelp(proxy=PROXY)
-            result = y.search(term, location, offset=offset, limit=limit, sort_by=sort_by, price=price)
-            return {
-                "status": "success",
-                "term": term,
-                "location": location,
-                "offset": offset,
-                "total_results": result.get("total_results"),
-                "results_count": len(result["businesses"]),
-                "search_url": result.get("search_url"),
-                "businesses": result["businesses"],
-            }
-
-        return with_cache(cache_key, produce)
-    except YelpError as ye:
-        return {"status": "error", "message": str(ye)}
+        urls = _inputs_from_body(body)
+        if not urls:
+            return {"status": "error", "message": "Provide 'url'/'alias' or 'urls'/'aliases'."}
+        y = BrightDataYelp()
+        snapshot_id = y.trigger_business(urls)
+        _save_job(snapshot_id, {"type": "business", "inputs": [alias_to_url(u) for u in urls], "created": time.time()})
+        return {
+            "status": "triggered",
+            "type": "business",
+            "job_id": snapshot_id,
+            "poll": f"/result/{snapshot_id}",
+            "note": "Poll /result/{job_id} every ~10s; jobs take ~30s to a few minutes.",
+        }
+    except BrightDataError as be:
+        return {"status": "error", "message": str(be)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/business/{id}")
+@app.post("/reviews/collect")
 @limiter.limit("50/second")
-async def business_details(
+async def collect_reviews(
     request: Request,
-    id: str = Path(..., description="Business alias (URL slug) or encoded biz id"),
+    body: dict = Body(
+        ...,
+        example={"url": "https://www.yelp.com/biz/blue-bottle-coffee-san-francisco-8", "limit_per_input": 20},
+    ),
 ):
-    """Full business detail: hours, phone, website, categories, photos, attributes."""
+    """Trigger a Yelp **reviews** collection. Returns a job_id to poll."""
     try:
-        cache_key = get_cache_key("yelp_biz", id)
-
-        def produce():
-            y = Yelp(proxy=PROXY)
-            data = y.business(id)
-            return {"status": "success", "business": data}
-
-        return with_cache(cache_key, produce)
-    except YelpError as ye:
-        return {"status": "error", "message": str(ye)}
+        urls = _inputs_from_body(body)
+        if not urls:
+            return {"status": "error", "message": "Provide 'url'/'alias' or 'urls'/'aliases'."}
+        limit = body.get("limit_per_input")
+        y = BrightDataYelp()
+        if not y.reviews_dataset:
+            return {
+                "status": "error",
+                "message": "BRIGHTDATA_YELP_REVIEWS_DATASET is not set. Add the Yelp Reviews scraper's gd_... id as an env var.",
+            }
+        snapshot_id = y.trigger_reviews(urls, limit_per_input=limit)
+        _save_job(snapshot_id, {"type": "reviews", "inputs": [alias_to_url(u) for u in urls], "created": time.time()})
+        return {
+            "status": "triggered",
+            "type": "reviews",
+            "job_id": snapshot_id,
+            "poll": f"/result/{snapshot_id}",
+            "note": "Poll /result/{job_id} every ~10s; jobs take ~30s to a few minutes.",
+        }
+    except BrightDataError as be:
+        return {"status": "error", "message": str(be)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/reviews")
+@app.get("/result/{job_id}")
 @limiter.limit("50/second")
-async def business_reviews(
+async def get_result(
     request: Request,
-    business_id: str = Query(..., description="Encoded biz id (from /search) or business alias"),
-    offset: int = Query(0, ge=0, description="Review offset"),
-    limit: int = Query(10, ge=1, le=50, description="Reviews per page (<=50)"),
-    sort_by: str = Query("DATE_DESC", description="DATE_DESC | DATE_ASC | RATING_DESC | RATING_ASC | ELITES_DESC"),
-    language: str = Query("en", description="Language code, e.g. 'en'"),
+    job_id: str = Path(..., description="job_id (snapshot_id) returned by a /collect call"),
 ):
-    """Paginated reviews for a business."""
+    """Poll a job. Returns status=running until data is ready, then the records."""
     try:
-        cache_key = get_cache_key("yelp_reviews", business_id, offset, limit, sort_by, language)
+        cached = _cached_result(job_id)
+        if cached:
+            return {**cached, "cached": True}
 
-        def produce():
-            y = Yelp(proxy=PROXY)
-            result = y.reviews(business_id, offset=offset, limit=limit, sort_by=sort_by, language=language)
-            return {
-                "status": "success",
-                "business_id": result.get("business_id"),
-                "offset": offset,
-                "total_results": result.get("total_results"),
-                "results_count": len(result["reviews"]),
-                "reviews": result["reviews"],
+        meta = _load_job(job_id)
+        y = BrightDataYelp()
+        res = y.result(job_id)
+        res["job_id"] = job_id
+        if meta.get("type"):
+            res["type"] = meta["type"]
+
+        if res.get("status") == "ready":
+            payload = {
+                "status": "ready",
+                "job_id": job_id,
+                "type": meta.get("type"),
+                "results_count": len(res.get("records") or []),
+                "records": res.get("records"),
             }
-
-        return with_cache(cache_key, produce, ttl=REVIEW_TTL)
-    except YelpError as ye:
-        return {"status": "error", "message": str(ye)}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-
-@app.get("/autocomplete")
-@limiter.limit("50/second")
-async def autocomplete(
-    request: Request,
-    prefix: str = Query(..., description="Typed prefix, e.g. 'coff'"),
-    location: str = Query("", description="Optional location context, e.g. 'San Francisco, CA'"),
-):
-    """Search suggestions (terms, businesses, categories) for a typed prefix."""
-    try:
-        cache_key = get_cache_key("yelp_ac", prefix, location)
-
-        def produce():
-            y = Yelp(proxy=PROXY)
-            result = y.autocomplete(prefix, location=location)
-            return {
-                "status": "success",
-                "prefix": prefix,
-                "location": location,
-                "terms": result.get("terms", []),
-                "businesses": result.get("businesses", []),
-                "categories": result.get("categories", []),
-            }
-
-        return with_cache(cache_key, produce)
-    except YelpError as ye:
-        return {"status": "error", "message": str(ye)}
+            _cache_result(job_id, payload)
+            return {**payload, "cached": False}
+        return res
+    except BrightDataError as be:
+        return {"status": "error", "message": str(be)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

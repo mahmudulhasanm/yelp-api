@@ -1,18 +1,21 @@
-# Yelp API (Unofficial)
+# Yelp API (via Bright Data prebuilt scrapers)
 
-FastAPI wrapper around Yelp's internal endpoints — same method as the Google Flights / Ads Transparency scrapers: direct requests to Yelp's own data endpoints with a Chrome-impersonated TLS session (`primp`), no headless browser. Includes Redis caching and per-IP rate limiting.
+FastAPI wrapper around Bright Data's **prebuilt Yelp Web Scraper API** for reliable business & review data. Yelp aggressively blocks live scraping (plain proxies → 403, and even Web Unlocker times out on Yelp's search page), so this uses Bright Data's maintained Yelp datasets instead — they handle the unblocking and return structured JSON.
 
-**How it works**
+## Model: asynchronous jobs
 
-- **Search** — `GET https://www.yelp.com/search/snippet` returns the search page with a `react_root_props` JSON blob; results come from `legacyProps.searchAppProps.searchPageProps.mainContentComponentsListProps`.
-- **Business detail** — `GET /biz/{alias}`; encoded biz id from `<meta name="yelp-biz-id">`, detail from the same JSON blob (with regex fallbacks for the visible page).
-- **Reviews** — `POST /gql/batch`, GraphQL `GetBusinessReviewFeed`, paginated via a base64 `after` offset cursor.
-- **Autocomplete** — `GET /search_suggest/v2/prefetch` returns JSON suggestion groups.
+Bright Data's scraper is a batch/async API — a collection takes ~30s to a few minutes. So this API is **job-based**:
+
+1. `POST /business/collect` or `POST /reviews/collect` → returns a `job_id`
+2. `GET /result/{job_id}` → poll every ~10s; returns `status: running` until data is ready, then the records
+
+Scope: **business details** and **reviews**, collected by business **URL or alias**. (Keyword search and autocomplete aren't covered by the prebuilt scraper — those were the exact pages that defeated live scraping.)
 
 ## Run
 
 ```bash
 pip install -r requirements.txt
+export BRIGHTDATA_API_KEY=your_key
 uvicorn main:app --reload
 # docs at http://localhost:8000/docs
 ```
@@ -26,53 +29,56 @@ docker run -p 8080:8080 --env-file .env yelp-api
 
 ## Endpoints
 
-### GET /search
+### POST /business/collect
 
-```
-/search?term=coffee&location=San+Francisco,+CA
-/search?term=plumbers&location=Seattle,+WA&offset=10&sort_by=rating&price=1,2
-```
+Trigger a business-detail collection.
 
-Params: `term`, `location`, `offset` (page size 10), `limit` (≤10), `sort_by` (recommended | rating | review_count | distance), `price` (`1`..`4` or CSV).
-
-Returns per business: `id` (encoded biz id — feed this to `/reviews`), `alias`, `name`, `url`, `rating`, `review_count`, `price`, `categories`, `phone`, `address`, `latitude`, `longitude`, `is_ad`, `photo`.
-
-### GET /business/{id}
-
-```
-/business/vons-1000-spirits-seattle-4
+```json
+{ "url": "https://www.yelp.com/biz/blue-bottle-coffee-san-francisco-8" }
 ```
 
-Accepts a business **alias** (URL slug) or an **encoded biz id**. Returns name, rating, review count, price, categories, phone, website, address, coordinates, `hours` (per-day map), `is_claimed`, photos, and attributes.
+Also accepts `{"alias": "blue-bottle-coffee-san-francisco-8"}`, or batches via `{"urls": [...]}` / `{"aliases": [...]}`. Returns:
 
-### GET /reviews
-
-```
-/reviews?business_id=Lw7NmZ3j-WEye97ywEmkXQ
-/reviews?business_id=vons-1000-spirits-seattle-4&offset=10&sort_by=RATING_DESC
+```json
+{ "status": "triggered", "type": "business", "job_id": "s_xxx", "poll": "/result/s_xxx" }
 ```
 
-`business_id` is the **encoded biz id** from `/search` results. An alias also works (it's resolved to the encoded id first, one extra request). Params: `offset`, `limit` (≤50), `sort_by` (DATE_DESC | DATE_ASC | RATING_DESC | RATING_ASC | ELITES_DESC), `language`.
+### POST /reviews/collect
 
-Returns per review: `id`, `rating`, `text`, `date`, `author_name`, `author_location`, `author_review_count`, `feedback`, `photos`.
+Trigger a reviews collection. Requires `BRIGHTDATA_YELP_REVIEWS_DATASET` to be set.
 
-### GET /autocomplete
-
-```
-/autocomplete?prefix=coff&location=San+Francisco,+CA
+```json
+{ "url": "https://www.yelp.com/biz/blue-bottle-coffee-san-francisco-8", "limit_per_input": 20 }
 ```
 
-Returns `terms`, `businesses`, and `categories` suggestion arrays.
+### GET /result/{job_id}
+
+Poll a job.
+
+```json
+// still working:
+{ "status": "running", "raw_status": "collecting", "job_id": "s_xxx" }
+
+// done:
+{ "status": "ready", "job_id": "s_xxx", "type": "business", "results_count": 1, "records": [ ... ] }
+```
+
+`records` is Bright Data's structured Yelp output (business name, rating, review count, address, hours, photos, etc. — or review objects for the reviews scraper). Finished results are cached in Redis (`RESULT_TTL`, default 24h), so re-polling a completed job is instant.
 
 ## Config (.env)
 
-`REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `CACHE_TTL` (default 3600s), `REVIEW_TTL` (default 21600s), `PROXY`, `YELP_REVIEW_DOC_ID`.
+| Var | Purpose |
+|---|---|
+| `BRIGHTDATA_API_KEY` | **Required.** Bright Data API key |
+| `BRIGHTDATA_YELP_BUSINESS_DATASET` | Business scraper dataset id (default `gd_lgugwl0519h1p14rwk`) |
+| `BRIGHTDATA_YELP_REVIEWS_DATASET` | Reviews scraper dataset id (set this yourself) |
+| `REQUEST_TIMEOUT` | HTTP timeout for Bright Data calls (default 30s) |
+| `REDIS_*`, `RESULT_TTL`, `JOB_TTL` | Optional job registry + result cache |
 
-Runs fine without Redis — caching just disables itself.
+Find a dataset id by opening the scraper in the Bright Data control panel — it's the `gd_...` in the URL.
 
-## Caveats
+## Notes
 
-- Unofficial scraper. Yelp blocks aggressively and **datacenter IPs are frequently blocked** — use a residential/rotating `PROXY` for anything beyond light use. A non-200 from Yelp surfaces as `{"status": "error", "message": "... likely blocked; try a proxy"}`.
-- The reviews GraphQL `documentId` is a persisted-query hash Yelp rotates. If `/reviews` stops returning data, capture a fresh `GetBusinessReviewFeed` request from browser DevTools (Network tab) and set `YELP_REVIEW_DOC_ID`.
-- Page JSON structure drifts when Yelp updates its frontend. Parsing is defensive (`.get()` chains + regex fallbacks), but if a field goes null, re-capture the payload and adjust `Yelp/parser.py`.
-- Respect Yelp's ToS and robots. For a stable, supported alternative, Yelp's official [Fusion API](https://docs.developer.yelp.com/) covers search, business, reviews and autocomplete with an API key.
+- Runs fine without Redis; it just won't label a job's `type` or cache finished results.
+- The `/collect` calls are fast (they only *trigger* a job). Only Bright Data's collection is slow, and that happens out of band — so this API never holds a long HTTP request open, which avoids the reverse-proxy (502/504) timeouts that block synchronous Yelp scraping.
+- Billing is per record collected (see your Bright Data plan; the Yelp scrapers include a monthly free tier).
