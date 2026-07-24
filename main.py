@@ -95,25 +95,48 @@ async def debug_search(
         .get("searchPageProps", {})
     )
     items = spp.get("mainContentComponentsListProps", []) or []
+
+    # Per-item type + props keys.
     sample = []
-    for it in items[:10]:
+    for it in items:
         if isinstance(it, dict):
-            entry = {
-                "keys": list(it.keys())[:20],
+            props = it.get("props") if isinstance(it.get("props"), dict) else {}
+            sample.append({
                 "layout": it.get("searchResultLayoutType"),
-                "hasBizId": "bizId" in it,
-            }
-            # peek one level deeper for where an id/name might live
-            for k, v in it.items():
-                if isinstance(v, dict) and ("biz" in k.lower() or "result" in k.lower()):
-                    entry[f"{k}_keys"] = list(v.keys())[:20]
-            sample.append(entry)
+                "type": it.get("type"),
+                "props_keys": list(props.keys())[:25],
+            })
+
+    # Recursively find the first dict that looks like a business record and
+    # report the path + its keys, so we know exactly what to parse.
+    found = {"path": None, "keys": None, "id_field": None}
+    id_fields = ("bizId", "encid", "encBizId", "businessId", "id")
+
+    def walk(node, path):
+        if found["path"]:
+            return
+        if isinstance(node, dict):
+            has_name = "name" in node
+            hit = next((f for f in id_fields if f in node), None)
+            if has_name and hit and any(k in node for k in ("rating", "reviewCount", "alias", "categories")):
+                found["path"] = path
+                found["keys"] = list(node.keys())[:40]
+                found["id_field"] = hit
+                return
+            for k, v in node.items():
+                walk(v, f"{path}.{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node[:30]):
+                walk(v, f"{path}[{i}]")
+
+    walk(spp, "spp")
+
     return {
         "html_len": len(html),
-        "root_keys": list(root.keys()),
         "spp_keys": list(spp.keys()),
         "items_count": len(items),
         "sample": sample,
+        "business_record": found,
     }
 
 
