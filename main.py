@@ -97,12 +97,42 @@ async def debug_inspect(
 
     html = Crawlbase().get(url)
     root = extract_root_props(html)
-    return {
+    out = {
         "html_len": len(html),
         "root_keys": list(root.keys()),
         "biz_id": extract_biz_id(html),
         "legacyProps_shape": keyshape(root.get("legacyProps", {}), depth),
     }
+
+    # If this is a search page, analyze the result sections in detail.
+    spp = root.get("legacyProps", {}).get("searchAppProps", {}).get("searchPageProps", {})
+    if spp:
+        sections = []
+        for it in spp.get("mainContentComponentsListProps", []) or []:
+            if not isinstance(it, dict) or it.get("type") != "searchResultSection":
+                continue
+            props = it.get("props") or {}
+            results = props.get("searchResults") or []
+            with_srb = sum(
+                1 for r in results
+                if isinstance(r, dict) and isinstance(r.get("searchResultBusiness"), dict)
+            )
+            info = {
+                "sectionId": props.get("sectionId"),
+                "isAdOnly": props.get("isAdOnly"),
+                "results_count": len(results),
+                "results_with_searchResultBusiness": with_srb,
+            }
+            # dump the first result that HAS business data, else the first result
+            populated = next(
+                (r for r in results if isinstance(r, dict) and isinstance(r.get("searchResultBusiness"), dict)),
+                results[0] if results else None,
+            )
+            if populated:
+                info["result_shape"] = keyshape(populated, 3)
+            sections.append(info)
+        out["search_sections"] = sections
+    return out
 
 
 @app.get("/search")
