@@ -75,6 +75,48 @@ async def root():
     }
 
 
+@app.get("/debug/search")
+async def debug_search(
+    term: str = Query("coffee"),
+    location: str = Query("San Francisco, CA"),
+):
+    """Diagnostic: dump the structure of Yelp's search payload so the parser
+    can be aligned to the current field names. Remove once parsing is fixed."""
+    from Yelp.crawlbase import Crawlbase
+    from Yelp.parser import extract_root_props
+    from urllib.parse import quote_plus
+
+    url = f"https://www.yelp.com/search?find_desc={quote_plus(term)}&find_loc={quote_plus(location)}"
+    html = Crawlbase().get(url)
+    root = extract_root_props(html)
+    spp = (
+        root.get("legacyProps", {})
+        .get("searchAppProps", {})
+        .get("searchPageProps", {})
+    )
+    items = spp.get("mainContentComponentsListProps", []) or []
+    sample = []
+    for it in items[:10]:
+        if isinstance(it, dict):
+            entry = {
+                "keys": list(it.keys())[:20],
+                "layout": it.get("searchResultLayoutType"),
+                "hasBizId": "bizId" in it,
+            }
+            # peek one level deeper for where an id/name might live
+            for k, v in it.items():
+                if isinstance(v, dict) and ("biz" in k.lower() or "result" in k.lower()):
+                    entry[f"{k}_keys"] = list(v.keys())[:20]
+            sample.append(entry)
+    return {
+        "html_len": len(html),
+        "root_keys": list(root.keys()),
+        "spp_keys": list(spp.keys()),
+        "items_count": len(items),
+        "sample": sample,
+    }
+
+
 @app.get("/search")
 @limiter.limit("50/second")
 async def search_businesses(
