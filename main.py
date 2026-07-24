@@ -96,47 +96,38 @@ async def debug_search(
     )
     items = spp.get("mainContentComponentsListProps", []) or []
 
-    # Per-item type + props keys.
-    sample = []
-    for it in items:
-        if isinstance(it, dict):
-            props = it.get("props") if isinstance(it.get("props"), dict) else {}
-            sample.append({
-                "layout": it.get("searchResultLayoutType"),
-                "type": it.get("type"),
-                "props_keys": list(props.keys())[:25],
-            })
-
-    # Recursively find the first dict that looks like a business record and
-    # report the path + its keys, so we know exactly what to parse.
-    found = {"path": None, "keys": None, "id_field": None}
-    id_fields = ("bizId", "encid", "encBizId", "businessId", "id")
-
-    def walk(node, path):
-        if found["path"]:
-            return
+    def keyshape(node, depth=2):
+        """Keys of a dict, recursing a couple levels so we see nested field names."""
         if isinstance(node, dict):
-            has_name = "name" in node
-            hit = next((f for f in id_fields if f in node), None)
-            if has_name and hit and any(k in node for k in ("rating", "reviewCount", "alias", "categories")):
-                found["path"] = path
-                found["keys"] = list(node.keys())[:40]
-                found["id_field"] = hit
-                return
-            for k, v in node.items():
-                walk(v, f"{path}.{k}")
-        elif isinstance(node, list):
-            for i, v in enumerate(node[:30]):
-                walk(v, f"{path}[{i}]")
+            out = {}
+            for k, v in list(node.items())[:40]:
+                if depth > 0 and isinstance(v, (dict, list)):
+                    out[k] = keyshape(v, depth - 1)
+                else:
+                    out[k] = type(v).__name__
+            return out
+        if isinstance(node, list):
+            return [keyshape(node[0], depth - 1)] if node else []
+        return type(node).__name__
 
-    walk(spp, "spp")
+    sections = []
+    for it in items:
+        if isinstance(it, dict) and it.get("type") == "searchResultSection":
+            props = it.get("props") or {}
+            results = props.get("searchResults") or []
+            entry = {
+                "sectionId": props.get("sectionId"),
+                "isAdOnly": props.get("isAdOnly"),
+                "results_count": len(results),
+            }
+            if results:
+                # full nested shape of the first business result
+                entry["first_result_shape"] = keyshape(results[0], depth=3)
+            sections.append(entry)
 
     return {
         "html_len": len(html),
-        "spp_keys": list(spp.keys()),
-        "items_count": len(items),
-        "sample": sample,
-        "business_record": found,
+        "sections": sections,
     }
 
 
