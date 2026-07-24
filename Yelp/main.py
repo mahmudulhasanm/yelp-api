@@ -116,18 +116,52 @@ class Yelp:
         sort_by -> recommended | rating | review_count | distance (best effort)
         price   -> "1", "2", "1,2", ... ($ .. $$$$)
         """
-        params = {
-            "find_desc": term,
-            "find_loc": location,
-            "start": offset,
-            "ns": 1,
-            "request_origin": "user",
-        }
+        from urllib.parse import quote_plus
+
+        c = self._client()
+
+        # 1) Warm up a session: load the homepage so Yelp sets its consent /
+        #    session cookies on this client before we ask for data. Hitting the
+        #    data endpoints cold is a strong bot signal.
+        try:
+            c.get(BASE + "/", headers=self._headers())
+        except Exception:
+            pass
+
+        q, loc = quote_plus(term), quote_plus(location)
+        page_url = f"{BASE}/search?find_desc={q}&find_loc={loc}"
+        if offset:
+            page_url += f"&start={offset}"
         if sort_by:
-            params["sortby"] = sort_by
+            page_url += f"&sortby={sort_by}"
         if price:
-            params["attrs"] = "RestaurantsPriceRange2." + price
-        html = self._get(f"{BASE}/search/snippet", params=params)
+            page_url += f"&attrs=RestaurantsPriceRange2.{price}"
+
+        # 2) Prefer the full search *page* (same react_root_props payload as the
+        #    XHR snippet, but far less aggressively bot-filtered).
+        r = c.get(page_url, headers=self._headers({"referer": BASE + "/"}))
+        html = r.text if r.status_code == 200 else None
+
+        # 3) Fallback: the XHR snippet endpoint, now with a valid referer and the
+        #    warmed-up cookie jar.
+        if html is None:
+            params = {
+                "find_desc": term, "find_loc": location, "start": offset,
+                "ns": 1, "request_origin": "user",
+            }
+            params = {k: str(v) for k, v in params.items()}
+            r2 = c.get(
+                f"{BASE}/search/snippet",
+                params=params,
+                headers=self._headers({"referer": page_url, "x-requested-with": "XMLHttpRequest"}),
+            )
+            if r2.status_code != 200:
+                raise YelpError(
+                    f"GET {BASE}/search -> HTTP {r.status_code}/{r2.status_code} "
+                    f"(Yelp is blocking these IPs — try residential proxies or Bright Data Web Unlocker)"
+                )
+            html = r2.text
+
         result = parse_search(html)
         result["businesses"] = result["businesses"][:limit]
         result["term"] = term
