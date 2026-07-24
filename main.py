@@ -75,59 +75,33 @@ async def root():
     }
 
 
-@app.get("/debug/search")
-async def debug_search(
-    term: str = Query("coffee"),
-    location: str = Query("San Francisco, CA"),
+@app.get("/debug/inspect")
+async def debug_inspect(
+    url: str = Query(..., description="Any Yelp URL to fetch via Crawlbase and inspect"),
+    depth: int = Query(2, ge=1, le=4),
 ):
-    """Diagnostic: dump the structure of Yelp's search payload so the parser
-    can be aligned to the current field names. Remove once parsing is fixed."""
+    """Diagnostic: fetch a Yelp URL and dump the shape of its embedded JSON so
+    parsers can be aligned to Yelp's current field names. Remove in production."""
     from Yelp.crawlbase import Crawlbase
-    from Yelp.parser import extract_root_props
-    from urllib.parse import quote_plus
+    from Yelp.parser import extract_root_props, extract_biz_id
 
-    url = f"https://www.yelp.com/search?find_desc={quote_plus(term)}&find_loc={quote_plus(location)}"
-    html = Crawlbase().get(url)
-    root = extract_root_props(html)
-    spp = (
-        root.get("legacyProps", {})
-        .get("searchAppProps", {})
-        .get("searchPageProps", {})
-    )
-    items = spp.get("mainContentComponentsListProps", []) or []
-
-    def keyshape(node, depth=2):
-        """Keys of a dict, recursing a couple levels so we see nested field names."""
+    def keyshape(node, d):
         if isinstance(node, dict):
             out = {}
             for k, v in list(node.items())[:40]:
-                if depth > 0 and isinstance(v, (dict, list)):
-                    out[k] = keyshape(v, depth - 1)
-                else:
-                    out[k] = type(v).__name__
+                out[k] = keyshape(v, d - 1) if d > 0 and isinstance(v, (dict, list)) else type(v).__name__
             return out
         if isinstance(node, list):
-            return [keyshape(node[0], depth - 1)] if node else []
+            return [keyshape(node[0], d - 1)] if node else []
         return type(node).__name__
 
-    sections = []
-    for it in items:
-        if isinstance(it, dict) and it.get("type") == "searchResultSection":
-            props = it.get("props") or {}
-            results = props.get("searchResults") or []
-            entry = {
-                "sectionId": props.get("sectionId"),
-                "isAdOnly": props.get("isAdOnly"),
-                "results_count": len(results),
-            }
-            if results:
-                # full nested shape of the first business result
-                entry["first_result_shape"] = keyshape(results[0], depth=3)
-            sections.append(entry)
-
+    html = Crawlbase().get(url)
+    root = extract_root_props(html)
     return {
         "html_len": len(html),
-        "sections": sections,
+        "root_keys": list(root.keys()),
+        "biz_id": extract_biz_id(html),
+        "legacyProps_shape": keyshape(root.get("legacyProps", {}), depth),
     }
 
 

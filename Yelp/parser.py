@@ -68,31 +68,42 @@ def _search_page_props(root: dict) -> dict:
     )
 
 
-def parse_search(html: str) -> dict:
-    """Parse the /search/snippet page into a normalised list of businesses."""
+def parse_search(html: str, include_ads: bool = False) -> dict:
+    """Parse the Yelp search page into a normalised list of businesses.
+
+    Current structure (2026):
+        searchPageProps.mainContentComponentsListProps[]
+          -> item.type == "searchResultSection"
+             -> item.props.searchResults[]
+                -> { bizId, searchResultBusiness{...}, scrollablePhotos{...} }
+    """
     root = extract_root_props(html)
     spp = _search_page_props(root)
     total = spp.get("searchContext", {}).get("totalResults", 0)
 
     businesses = []
     for item in spp.get("mainContentComponentsListProps", []):
-        biz_id = item.get("bizId")
-        if not biz_id:
-            continue  # ad slots / separators / cta cards have no bizId
-        businesses.append(_normalise_search_item(item))
+        if not isinstance(item, dict) or item.get("type") != "searchResultSection":
+            continue
+        props = item.get("props") or {}
+        if props.get("isAdOnly") and not include_ads:
+            continue  # skip pure-ad sections
+        for res in props.get("searchResults") or []:
+            biz = _normalise_search_item(res)
+            if biz:
+                businesses.append(biz)
 
     return {"total_results": total, "businesses": businesses}
 
 
-def _normalise_search_item(item: str) -> dict:
-    """Flatten one search card into a stable, documented shape."""
-    biz = item.get("searchResultBusiness", {}) or item
-
-    def rating():
-        r = biz.get("rating")
-        if isinstance(r, dict):
-            return r.get("value") or r.get("rating")
-        return r
+def _normalise_search_item(res: dict) -> Optional[dict]:
+    """Flatten one search result into a stable shape, or None if it has no
+    business payload (some cards are portfolios/placeholders)."""
+    if not isinstance(res, dict):
+        return None
+    biz = res.get("searchResultBusiness")
+    if not isinstance(biz, dict) or not biz.get("name"):
+        return None
 
     categories = [
         c.get("title")
@@ -100,33 +111,30 @@ def _normalise_search_item(item: str) -> dict:
         if isinstance(c, dict) and c.get("title")
     ]
 
-    location = biz.get("formattedAddress")
-    if not location:
-        parts = biz.get("neighborhoods") or []
-        location = ", ".join(p for p in parts if p) or None
+    photos = []
+    for p in ((res.get("scrollablePhotos") or {}).get("photoList") or []):
+        if isinstance(p, dict) and p.get("src"):
+            photos.append(p["src"])
 
-    coords = biz.get("mapMarker") or biz.get("coordinates") or {}
-    photos = [p.get("src") for p in (biz.get("photos") or []) if isinstance(p, dict) and p.get("src")]
+    snippet = res.get("snippet")
+    snippet_text = snippet.get("text") if isinstance(snippet, dict) else None
 
     return {
-        "id": item.get("bizId"),
+        "id": res.get("bizId"),
         "alias": biz.get("alias"),
         "name": biz.get("name"),
-        "url": _abs_url(biz.get("businessUrl") or biz.get("website")),
-        "rating": rating(),
+        "url": _abs_url(biz.get("businessUrl") or res.get("businessUrl")),
+        "rating": biz.get("rating"),
         "review_count": biz.get("reviewCount"),
-        "price": biz.get("priceRange") or biz.get("price"),
+        "price": biz.get("priceRange"),
         "categories": categories,
         "phone": biz.get("phone"),
-        "address": location,
+        "address": biz.get("formattedAddress"),
         "neighborhoods": biz.get("neighborhoods") or [],
-        "latitude": coords.get("latitude"),
-        "longitude": coords.get("longitude"),
-        "is_ad": bool(item.get("adLoggingInfo") or biz.get("isAd")),
+        "is_ad": bool(biz.get("isAd") or res.get("isAd")),
         "photo": photos[0] if photos else None,
         "photos": photos,
-        "snippet": (biz.get("snippet") or {}).get("text") if isinstance(biz.get("snippet"), dict) else biz.get("snippet"),
-        "service_area_business": biz.get("serviceAreaBusiness"),
+        "snippet": snippet_text,
     }
 
 
